@@ -168,13 +168,24 @@ main{max-width:560px;margin:0 auto;padding:4px 16px calc(120px + env(safe-area-i
 
 #toast{position:fixed;z-index:30;left:50%;bottom:calc(150px + env(safe-area-inset-bottom));transform:translate(-50%,20px);background:var(--text);color:var(--bg);padding:10px 16px;border-radius:12px;font-size:14px;opacity:0;pointer-events:none;transition:all .25s;max-width:calc(100% - 32px);text-align:center}
 #toast.show{opacity:1;transform:translate(-50%,0)}
+#syncBtn[data-s=synced]{color:var(--accent)}
+#syncBtn[data-s=pending],#syncBtn[data-s=connecting]{color:var(--warn)}
+#syncBtn[data-s=offline]{color:var(--muted)}
+#syncBtn[data-s=signedout],#syncBtn[data-s=denied]{color:var(--danger)}
+.banner{display:flex;align-items:center;gap:12px;background:var(--accent-soft);border-color:transparent}
+.banner .grow b{display:block}
+.err{color:var(--danger);font-size:14px;min-height:20px;margin-top:8px}
+.linkbtn{background:none;border:0;color:var(--accent);padding:6px 0;font-size:14px}
 [hidden]{display:none!important}
 </style>
 </head>
 <body>
 <header class="top">
   <div class="top-in">
-    <div class="iconbtn" aria-hidden="true"></div>
+    <button class="iconbtn" id="syncBtn" hidden aria-label="Sync">
+      <svg class="i" viewBox="0 0 24 24"><path d="M7 18.5h10.5a4 4 0 0 0 .4-7.98A6 6 0 0 0 6.3 9.6 4.5 4.5 0 0 0 7 18.5z"/><path id="syncMark" d=""/></svg>
+    </button>
+    <div class="iconbtn" id="syncSpacer" aria-hidden="true"></div>
     <div class="month">
       <button id="prev" aria-label="Previous month">‹</button>
       <button id="monthLabel" class="num" title="Jump to this month"></button>
@@ -204,6 +215,8 @@ main{max-width:560px;margin:0 auto;padding:4px 16px calc(120px + env(safe-area-i
 <div id="toast" role="status" aria-live="polite"></div>
 <input type="file" id="importFile" accept="application/json,.json" hidden>
 
+<script src="firebase-config.js"></script>
+<script src="sync.js"></script>
 <script>
 'use strict';
 /* ---------- Storage ---------- */
@@ -242,10 +255,17 @@ function load() {
   return defaults();
 }
 let db = load();
-function save() {
-  try { localStorage.setItem(KEY, JSON.stringify(db)); }
-  catch (e) { toast("Couldn't save on this device. Use Settings → Back up."); }
+function saveLocal() {
+  try { localStorage.setItem(KEY, JSON.stringify(db)); return true; }
+  catch (e) { return false; }
 }
+function save() {
+  const ok = saveLocal();
+  if (typeof Sync !== 'undefined' && Sync.live) Sync.push();
+  else if (!ok) toast("Couldn't save on this device. Use Settings → Back up.");
+}
+// Look an item up again at save time: the other phone may have replaced it while a form was open.
+const fresh = (list, item) => item && db[list].find(x => x.id === item.id);
 
 /* ---------- Helpers ---------- */
 const $ = s => document.querySelector(s);
@@ -371,7 +391,7 @@ function viewOverview() {
   if (left < 0) pill = `<span class="pill over">${money(-left)} over budget</span>`;
   else if (isCur && budget) { const dl = daysInMonth(ym) - new Date().getDate() + 1; pill = `<span class="pill">${dl} day${dl > 1 ? 's' : ''} left · about ${money(left / dl, true)} a day</span>`; }
 
-  let h = `<section class="card hero">
+  let h = syncBanner() + `<section class="card hero">
     <div class="label">${left < 0 ? 'Over budget' : 'Left to spend'}</div>
     <div class="big num ${left < 0 ? 'over' : ''}">${money(Math.abs(left))}</div>
     <div class="bar thick ${lv}"><i style="width:${pct}%"></i></div>
@@ -605,8 +625,9 @@ function txForm(id) {
     if (type === 'expense' && !catId) { toast('Pick a category'); return; }
     const date = f.date.value || isoDate(new Date());
     const data = { type, amount, catId, date, note: f.note.value.trim() };
-    if (t) Object.assign(t, data);
-    else db.transactions.push({ id: uid(), created: Date.now(), ...data });
+    const cur = fresh('transactions', t);
+    if (cur) Object.assign(cur, data);
+    else db.transactions.push(t ? { ...t, ...data } : { id: uid(), created: Date.now(), ...data });
     save(); closeSheet();
     const ym = date.slice(0, 7);
     if (ym !== state.ym) toast(`Saved to ${monthLabel(ym)}`);
@@ -643,7 +664,9 @@ function catForm(id, back) {
     if (isNaN(limit)) { toast('Check the budget amount'); return; }
     const data = { name: f.name.value.trim(), emoji: f.emoji.value.trim() || '🏷️', limit };
     if (!data.name) return;
-    if (c) Object.assign(c, data);
+    const cur = fresh('categories', c);
+    if (cur) Object.assign(cur, data);
+    else if (c) db.categories.push({ ...c, ...data });
     else db.categories.push({ id: uid(), color: PALETTE[db.categories.length % PALETTE.length], ...data });
     done();
   });
@@ -674,7 +697,8 @@ function billForm(id) {
     if (!(amount > 0)) { toast('Enter an amount'); return; }
     if (!(due >= 1 && due <= 31)) { toast('Due day should be 1–31'); return; }
     const data = { name: f.name.value.trim(), amount, dueDay: due, catId: f.cat.value || null };
-    if (b) Object.assign(b, data); else db.bills.push({ id: uid(), paid: {}, ...data });
+    const cur = fresh('bills', b);
+    if (cur) Object.assign(cur, data); else db.bills.push(b ? { ...b, ...data } : { id: uid(), paid: {}, ...data });
     save(); closeSheet(); render(); toast('Bill saved');
   });
 }
@@ -705,12 +729,13 @@ function goalForm(id) {
     if (!(target > 0)) { toast('Enter a target amount'); return; }
     if (isNaN(saved)) { toast('Check the saved amount'); return; }
     const data = { name: f.name.value.trim(), emoji: f.emoji.value.trim() || '🎯', target, saved, by: f.by.value || '' };
-    if (g) Object.assign(g, data); else db.goals.push({ id: uid(), ...data });
+    const cur = fresh('goals', g);
+    if (cur) Object.assign(cur, data); else db.goals.push(g ? { ...g, ...data } : { id: uid(), ...data });
     save(); closeSheet(); render(); toast('Goal saved');
   });
 }
 function fundGoal(id) {
-  const g = db.goals.find(x => x.id === id);
+  let g = db.goals.find(x => x.id === id);
   const root = openSheet(`<form id="f" autocomplete="off"><h2>${esc(g.emoji || '🎯')} ${esc(g.name)}</h2>
     <div class="sub" style="margin:-8px 0 12px">${money(g.saved)} saved of ${money(g.target, true)}</div>
     ${moneyInput('amount', '', true)}
@@ -719,6 +744,8 @@ function fundGoal(id) {
   const apply = sign => {
     const a = parseAmt(f.amount.value);
     if (!(a > 0)) { toast('Enter an amount'); return; }
+    g = fresh('goals', g);
+    if (!g) { closeSheet(); toast('That goal was deleted on the other phone'); return; }
     const before = g.saved || 0;
     g.saved = Math.max(0, Math.round((before + sign * a) * 100) / 100);
     save(); closeSheet(); render();
@@ -742,8 +769,9 @@ function settingsSheet() {
       <button class="btn sm primary" data-add-cat>+ Category</button></div>
     <h4>Currency</h4>
     <label class="field" style="margin-top:0"><select id="cur">${CURRENCIES.map(c => `<option ${c === db.settings.currency ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
+    ${syncSection()}
     <h4>Your data</h4>
-    <div class="note">Everything is saved on this phone only, in this browser. Back up now and then, especially before clearing browser data or switching phones.</div>
+    <div class="note">${Sync.live ? 'Your budget is saved in the cloud and on this phone. A backup file is still a good idea once in a while.' : 'Everything is saved on this phone only, in this browser. Back up now and then, especially before clearing browser data or switching phones.'}</div>
     <div class="actions" style="flex-wrap:wrap">
       <button class="btn" data-export>⬇️ Back up</button>
       <button class="btn" data-import>⬆️ Restore</button>
@@ -757,12 +785,74 @@ function settingsSheet() {
   root.querySelector('#cur').onchange = e => { db.settings.currency = e.target.value; save(); render(); settingsSheet(); };
   root.querySelector('[data-export]').onclick = exportData;
   root.querySelector('[data-import]').onclick = () => $('#importFile').click();
+  root.querySelector('[data-signin]')?.addEventListener('click', signInSheet);
+  root.querySelector('[data-signout]')?.addEventListener('click', async () => {
+    if (!confirm('Sign out? This phone keeps a copy but stops syncing until you sign in again.')) return;
+    await Sync.signOut(); closeSheet(); toast('Signed out');
+  });
   root.querySelector('[data-reset]').onclick = () => {
-    if (!confirm('Erase all spending, bills, goals and categories on this phone? Back up first if you might want them.')) return;
+    if (!confirm(Sync.live ? 'Erase the SHARED budget? This deletes all spending, bills, goals and categories for both of you. Back up first if you might want them.' : 'Erase all spending, bills, goals and categories on this phone? Back up first if you might want them.')) return;
     if (!confirm('Really erase everything? This cannot be undone.')) return;
     db = defaults(); save(); closeSheet(); state.ym = thisMonth(); render(); toast('Fresh start');
   };
 }
+/* Sync UI */
+const SYNC_TEXT = {
+  synced: 'Synced', pending: 'Saving to the cloud…', connecting: 'Connecting…',
+  offline: 'Offline. Changes will sync when you are back online.',
+  signedout: 'Not signed in', denied: "This account isn't allowed to open the shared budget."
+};
+function syncSection() {
+  if (!Sync.enabled) return '';
+  const u = Sync.user;
+  return `<h4>Sync between phones</h4>
+    ${u ? `<div class="set-row"><div class="grow"><div class="name">${esc(u.email)}</div><div class="sub">${esc(SYNC_TEXT[Sync.status] || '')}</div></div>
+      <button class="btn sm" data-signout>Sign out</button></div>`
+      : `<div class="set-row"><div class="grow"><div class="name">Not signed in</div><div class="sub">Sign in so you both see the same budget.</div></div>
+      <button class="btn sm primary" data-signin>Sign in</button></div>`}`;
+}
+function signInSheet() {
+  const root = openSheet(`<form id="f"><h2>Sign in to sync</h2>
+    <div class="sub" style="margin-top:-8px">Use the email and password for your budget account.</div>
+    <label class="field"><span>Email</span><input name="email" type="email" autocomplete="username" autocapitalize="off" required autofocus></label>
+    <label class="field"><span>Password</span><input name="password" type="password" autocomplete="current-password" required></label>
+    <div class="err" id="signErr"></div>
+    <button type="button" class="linkbtn" data-forgot>Forgot password?</button>
+    <div class="actions"><span class="spacer"></span><button type="button" class="btn" data-cancel>Cancel</button><button class="btn primary" id="signBtn">Sign in</button></div></form>`);
+  const f = root.querySelector('#f'), err = root.querySelector('#signErr'), btn = root.querySelector('#signBtn');
+  wireCommon(root);
+  root.querySelector('[data-forgot]').onclick = async () => {
+    if (!f.email.value.trim()) { err.textContent = 'Type your email first.'; f.email.focus(); return; }
+    try { await Sync.resetPassword(f.email.value); err.textContent = ''; toast('Check your email for a reset link'); }
+    catch (e) { err.textContent = Sync.errorText(e); }
+  };
+  f.addEventListener('submit', async e => {
+    e.preventDefault();
+    btn.disabled = true; btn.textContent = 'Signing in…'; err.textContent = '';
+    try { await Sync.signIn(f.email.value, f.password.value); closeSheet(); toast('Signed in · syncing'); }
+    catch (ex) { err.textContent = Sync.errorText(ex); btn.disabled = false; btn.textContent = 'Sign in'; }
+  });
+}
+const SYNC_MARKS = { synced: 'M9.5 13.5l2 2 3.5-4', pending: 'M12 11v3.5', connecting: 'M12 11v3.5', offline: 'M9 11.5l6 4M15 11.5l-6 4', signedout: 'M12 10.5v3M12 16v.01', denied: 'M12 10.5v3M12 16v.01' };
+function updateSyncBtn() {
+  const btn = $('#syncBtn'), on = Sync.enabled;
+  btn.hidden = !on; $('#syncSpacer').hidden = on;
+  if (!on) return;
+  const s = Sync.status;
+  btn.dataset.s = s;
+  $('#syncMark').setAttribute('d', SYNC_MARKS[s] || '');
+  btn.setAttribute('aria-label', 'Sync: ' + (SYNC_TEXT[s] || s));
+  btn.title = SYNC_TEXT[s] || s;
+}
+function syncBanner() {
+  if (!Sync.enabled) return '';
+  if (Sync.status === 'signedout') return `<section class="card banner"><div class="emoji" style="background:var(--card)">💞</div>
+    <div class="grow"><b>Share this budget</b><span class="sub">Sign in so you both see the same numbers.</span></div>
+    <button class="btn sm primary" data-act="signin">Sign in</button></section>`;
+  if (Sync.status === 'denied') return `<section class="card banner" style="background:color-mix(in srgb,var(--danger) 12%,transparent)"><div class="grow"><b>Can't open the shared budget</b><span class="sub">This account isn't on the allowed list. Check the Firestore rules.</span></div></section>`;
+  return '';
+}
+
 function exportData() {
   const blob = new Blob([JSON.stringify(db, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
@@ -780,7 +870,7 @@ $('#importFile').addEventListener('change', e => {
     try {
       const d = JSON.parse(r.result);
       if (!d || !Array.isArray(d.categories) || !Array.isArray(d.transactions)) throw new Error('bad');
-      if (!confirm(`Restore this backup? It replaces what's on this phone now (${d.transactions.length} entries, ${(d.bills || []).length} bills, ${(d.goals || []).length} goals).`)) return;
+      if (!confirm(`Restore this backup? It replaces ${Sync.live ? 'the shared budget for both of you' : "what's on this phone now"} (${d.transactions.length} entries, ${(d.bills || []).length} bills, ${(d.goals || []).length} goals).`)) return;
       db = normalize(d); save(); closeSheet(); render(); toast('Backup restored');
     } catch (err) { toast("That file isn't a budget backup"); }
   };
@@ -794,6 +884,7 @@ $('#main').addEventListener('click', e => {
   switch (el.dataset.act) {
     case 'tab': setTab(el.dataset.tab); break;
     case 'settings': settingsSheet(); break;
+    case 'signin': signInSheet(); break;
     case 'filter': state.filterCat = id || 'none'; state.tab = 'spending'; try { localStorage.setItem(KEY + ':tab', 'spending'); } catch (_) {} render(); window.scrollTo(0, 0); break;
     case 'filter-chip': state.filterCat = id || null; render(); break;
     case 'add-tx': txForm(); break;
@@ -812,10 +903,20 @@ $('#prev').addEventListener('click', () => { state.ym = shiftMonth(state.ym, -1)
 $('#next').addEventListener('click', () => { state.ym = shiftMonth(state.ym, 1); render(); });
 $('#monthLabel').addEventListener('click', () => { if (state.ym !== thisMonth()) { state.ym = thisMonth(); render(); } });
 $('#settingsBtn').addEventListener('click', settingsSheet);
+$('#syncBtn').addEventListener('click', () => Sync.user ? settingsSheet() : signInSheet());
+let lastSyncStatus = Sync.status;
+Sync.onStatus(s => {
+  updateSyncBtn();
+  // Redraw when the sign-in banner should appear or disappear
+  if ((s === 'signedout' || s === 'denied') !== (lastSyncStatus === 'signedout' || lastSyncStatus === 'denied')) render();
+  lastSyncStatus = s;
+});
 // Refresh "today" if the app stays open across midnight / month change
 document.addEventListener('visibilitychange', () => { if (!document.hidden) render(); });
 
 render();
+updateSyncBtn();
+Sync.init();
 
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
   window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
