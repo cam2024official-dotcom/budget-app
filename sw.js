@@ -1,5 +1,5 @@
 // Lets the app open offline. Uses the latest version when online, the saved copy when not.
-const CACHE = 'budget-v4';
+const CACHE = 'budget-v5';
 const FILES = ['./', './index.html', './sync.js', './firebase-config.js', './manifest.webmanifest', './icon.svg', './icon-180.png', './icon-192.png', './icon-512.png'];
 const SDK_HOST = 'https://www.gstatic.com';
 
