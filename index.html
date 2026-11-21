@@ -9,7 +9,12 @@
 <script>
   // Apply the saved theme before the page draws, so there's no flash of the wrong colors.
   try { var th = localStorage.getItem('budget-app-v1:theme'); if (th) document.documentElement.dataset.theme = th; } catch (e) {}
+  var fo = 'script'; try { fo = localStorage.getItem('budget-app-v1:font') || 'script'; } catch (e) {}
+  document.documentElement.dataset.font = fo;
 </script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Great+Vibes&display=swap">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Budget">
@@ -65,6 +70,17 @@
 :root[data-theme=pink] .btn.primary{background:linear-gradient(145deg,#ff6fa3,#e6457f);border-color:#e6457f}
 :root[data-theme=pink] .tabbar button.on::after{content:"♥";font-size:9px;line-height:1;margin-top:-1px}
 :root[data-theme=pink] .empty .e::after{content:" 🎀"}
+/* Calligraphy titles (numbers and small text stay in the regular font for readability) */
+:root[data-font=script]{--script:"Great Vibes","Snell Roundhand","Apple Chancery","Segoe Script",cursive}
+:root[data-font=script] #monthLabel{font-family:var(--script);font-weight:400;font-size:27px;letter-spacing:.01em;line-height:1}
+:root[data-font=script] .card h3{font-family:var(--script);font-weight:400;font-size:27px;line-height:1.1;align-items:center}
+:root[data-font=script] .card h3 .link,:root[data-font=script] .card h3 span{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+:root[data-font=script] .hero .label{font-family:var(--script);font-size:25px;line-height:1.1;color:var(--text);opacity:.8}
+:root[data-font=script] .sheet h2{font-family:var(--script);font-weight:400;font-size:34px;line-height:1.1}
+:root[data-font=script] .brand span{font-family:var(--script);font-weight:400;font-size:34px}
+:root[data-font=script] .empty b{font-family:var(--script);font-weight:400;font-size:28px;display:inline-block;margin-bottom:4px}
+:root[data-font=script] .banner .grow b{font-family:var(--script);font-weight:400;font-size:24px}
+:root[data-font=script] .goal .name{font-family:var(--script);font-weight:400;font-size:24px;line-height:1.15}
 *{box-sizing:border-box}
 html,body{margin:0}
 body{background:var(--bg);color:var(--text);font:16px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-tap-highlight-color:transparent;-webkit-font-smoothing:antialiased}
@@ -938,8 +954,10 @@ function settingsSheet() {
       <div class="grow"><div class="name">Paycheck calculator</div><div class="sub num">${payConfigured() ? `About ${money(calcPay(pay(), { hours: pay().hours, otHours: pay().otHours }).net)} take-home` : 'Not set up yet'}</div></div>
       <button class="btn sm" data-pay>${payConfigured() ? 'Edit' : 'Set up'}</button></div>
     <label class="field"><span>Pay periods run every 2 weeks, starting</span><input type="date" id="anchor" value="${anchor()}"></label>
-    <h4>Theme <span style="text-transform:none;letter-spacing:0;font-weight:400">· this device</span></h4>
+    <h4>Theme &amp; font <span style="text-transform:none;letter-spacing:0;font-weight:400">· this device</span></h4>
     <div class="seg" id="themeSeg">${THEMES.map(([v, label]) => `<button type="button" data-theme-pick="${v}" class="${currentTheme() === v ? 'on' : ''}">${label}</button>`).join('')}</div>
+    <div class="seg">${[['script', '<span style="font-family:\'Great Vibes\',cursive;font-size:21px;line-height:1">Calligraphy</span>'], ['classic', 'Classic']].map(([v, label]) =>
+      `<button type="button" data-font-pick="${v}" class="${document.documentElement.dataset.font === v ? 'on' : ''}">${label}</button>`).join('')}</div>
     <h4>Currency</h4>
     <label class="field" style="margin-top:0"><select id="cur">${CURRENCIES.map(c => `<option ${c === db.settings.currency ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
     ${syncSection()}
@@ -958,6 +976,11 @@ function settingsSheet() {
   root.querySelectorAll('[data-theme-pick]').forEach(b => b.onclick = () => {
     setTheme(b.dataset.themePick);
     root.querySelectorAll('[data-theme-pick]').forEach(x => x.classList.toggle('on', x === b));
+  });
+  root.querySelectorAll('[data-font-pick]').forEach(b => b.onclick = () => {
+    document.documentElement.dataset.font = b.dataset.fontPick;
+    try { localStorage.setItem(KEY + ':font', b.dataset.fontPick); } catch (e) {}
+    root.querySelectorAll('[data-font-pick]').forEach(x => x.classList.toggle('on', x === b));
   });
   root.querySelector('[data-pay]').onclick = () => payForm(true);
   root.querySelector('#anchor').onchange = e => {

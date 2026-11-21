@@ -1,5 +1,5 @@
 // Lets the app open offline. Uses the latest version when online, the saved copy when not.
-const CACHE = 'budget-v5';
+const CACHE = 'budget-v6';
 const FILES = ['./', './index.html', './sync.js', './firebase-config.js', './manifest.webmanifest', './icon.svg', './icon-180.png', './icon-192.png', './icon-512.png'];
 const SDK_HOST = 'https://www.gstatic.com';
 
@@ -13,7 +13,8 @@ self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return;
   const url = new URL(e.request.url);
   const sameOrigin = url.origin === location.origin;
-  const sdk = url.origin === SDK_HOST && url.pathname.startsWith('/firebasejs/');
+  const sdk = (url.origin === SDK_HOST && url.pathname.startsWith('/firebasejs/'))
+    || url.origin === 'https://fonts.googleapis.com' || url.origin === 'https://fonts.gstatic.com'; // library + font files: saved copy first
   if (!sameOrigin && !sdk) return; // Firebase's own data traffic goes straight to the network
   e.respondWith(caches.open(CACHE).then(cache => {
     if (sdk) {
