@@ -111,7 +111,8 @@ const Sync = (() => {
     for (let i = 0; i < ops.length; i += CHUNK) {
       const batch = fb.writeBatch(fs);
       ops.slice(i, i + CHUNK).forEach(([kind, c, x]) => {
-        if (kind === 'settings') batch.set(home(), { settings: c }, { merge: true });
+        // Replace (not merge) so removed keys, like a cleared custom-hours entry, are removed in the cloud too
+        if (kind === 'settings') batch.set(home(), { settings: c });
         else if (kind === 'set') batch.set(fb.doc(col(c), x.id), x);
         else batch.delete(fb.doc(col(c), x));
       });

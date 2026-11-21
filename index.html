@@ -172,6 +172,10 @@ main{max-width:560px;margin:0 auto;padding:4px 16px calc(120px + env(safe-area-i
 #syncBtn[data-s=pending],#syncBtn[data-s=connecting]{color:var(--warn)}
 #syncBtn[data-s=offline]{color:var(--muted)}
 #syncBtn[data-s=signedout],#syncBtn[data-s=denied]{color:var(--danger)}
+.brk{display:flex;justify-content:space-between;gap:8px;font-size:14px;color:var(--muted);margin-top:6px}
+.brk.total{color:var(--text);font-weight:600}
+.payrow{display:flex;align-items:center;gap:8px;margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
+.payrow b{font-size:18px}
 .banner{display:flex;align-items:center;gap:12px;background:var(--accent-soft);border-color:transparent}
 .banner .grow b{display:block}
 .err{color:var(--danger);font-size:14px;min-height:20px;margin-top:8px}
@@ -187,9 +191,9 @@ main{max-width:560px;margin:0 auto;padding:4px 16px calc(120px + env(safe-area-i
     </button>
     <div class="iconbtn" id="syncSpacer" aria-hidden="true"></div>
     <div class="month">
-      <button id="prev" aria-label="Previous month">‹</button>
-      <button id="monthLabel" class="num" title="Jump to this month"></button>
-      <button id="next" aria-label="Next month">›</button>
+      <button id="prev" aria-label="Previous pay period">‹</button>
+      <button id="monthLabel" class="num" title="Jump to this pay period"></button>
+      <button id="next" aria-label="Next pay period">›</button>
     </div>
     <button class="iconbtn" id="settingsBtn" aria-label="Settings">
       <svg class="i" viewBox="0 0 24 24"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></svg>
@@ -298,9 +302,64 @@ function parseAmt(v) {
 function ordinal(n) { const s = ['th', 'st', 'nd', 'rd'], v = n % 100; return n + (s[(v - 20) % 10] || s[v] || s[0]); }
 const UNCAT = { id: null, name: 'Uncategorized', emoji: '❔', limit: 0, color: '#8a8f8b' };
 const cat = id => db.categories.find(c => c.id === id) || UNCAT;
-const txIn = ym => db.transactions.filter(t => t.date && t.date.startsWith(ym));
-const spentIn = (ym, catId) => txIn(ym).filter(t => t.type !== 'income' && (catId === undefined || t.catId === catId)).reduce((s, t) => s + t.amount, 0);
-const incomeIn = ym => txIn(ym).filter(t => t.type === 'income').reduce((s, t) => s + t.amount, 0);
+/* ---------- Pay periods (every 2 weeks from an anchor Monday) ---------- */
+const DEFAULT_ANCHOR = '2026-11-23';
+const PERIOD_DAYS = 14;
+const dayNum = iso => { const [y, m, d] = iso.split('-').map(Number); return Math.round(Date.UTC(y, m - 1, d) / 864e5); };
+const fromDayNum = n => new Date(n * 864e5).toISOString().slice(0, 10);
+const todayISO = () => isoDate(new Date());
+const anchor = () => db.settings.payAnchor || DEFAULT_ANCHOR;
+function periodOf(iso) { const a = dayNum(anchor()); return fromDayNum(a + Math.floor((dayNum(iso) - a) / PERIOD_DAYS) * PERIOD_DAYS); }
+const thisPeriod = () => periodOf(todayISO());
+const shiftPeriod = (pk, n) => fromDayNum(dayNum(pk) + n * PERIOD_DAYS);
+const periodEnd = pk => fromDayNum(dayNum(pk) + PERIOD_DAYS - 1);
+const inPeriod = (iso, pk) => iso >= pk && iso <= periodEnd(pk);
+function shortDate(iso, opt) { const [y, m, d] = iso.split('-').map(Number); return new Date(y, m - 1, d).toLocaleDateString(undefined, opt || { month: 'short', day: 'numeric' }); }
+function periodLabel(pk) {
+  const end = periodEnd(pk), yr = String(new Date().getFullYear());
+  return `${shortDate(pk)} – ${shortDate(end, end.slice(0, 4) !== yr ? { month: 'short', day: 'numeric', year: 'numeric' } : undefined)}`;
+}
+
+const txIn = pk => { const e = periodEnd(pk); return db.transactions.filter(t => t.date && t.date >= pk && t.date <= e); };
+const spentIn = (pk, catId) => txIn(pk).filter(t => t.type !== 'income' && (catId === undefined || t.catId === catId)).reduce((s, t) => s + t.amount, 0);
+
+/* ---------- Paycheck calculator ---------- */
+// 2026 federal brackets and standard deduction (IRS Rev. Proc. 2025-32)
+const BRACKETS = {
+  single:  { std: 16100, b: [[12400, .10], [50400, .12], [105700, .22], [201775, .24], [256225, .32], [640600, .35], [Infinity, .37]] },
+  married: { std: 32200, b: [[24800, .10], [100800, .12], [211400, .22], [403550, .24], [512450, .32], [768700, .35], [Infinity, .37]] },
+  hoh:     { std: 24150, b: [[17700, .10], [67450, .12], [105700, .22], [201750, .24], [256200, .32], [640600, .35], [Infinity, .37]] }
+};
+function fedTaxAnnual(income, filing) {
+  const t = BRACKETS[filing] || BRACKETS.single;
+  let x = Math.max(0, income - t.std), prev = 0, tax = 0;
+  for (const [cap, rate] of t.b) { if (x <= prev) break; tax += (Math.min(x, cap) - prev) * rate; prev = cap; }
+  return tax;
+}
+const PAY_DEFAULTS = { rate: 0, hours: 80, otHours: 0, otMult: 1.5, filing: 'single', retirePct: 0, pretax: 0, statePct: 0, fedPct: null, extraFed: 0, posttax: 0 };
+const pay = () => ({ ...PAY_DEFAULTS, ...(db.settings.pay || {}) });
+const payConfigured = () => pay().rate > 0;
+function hoursFor(pk) { const p = pay(), o = (db.settings.periodHours || {})[pk]; return { hours: o?.hours ?? p.hours, otHours: o?.otHours ?? p.otHours, custom: !!o }; }
+function calcPay(p, h) {
+  const r2 = n => Math.round(n * 100) / 100;
+  const regular = p.rate * h.hours, overtime = p.rate * p.otMult * h.otHours, gross = regular + overtime;
+  const retire = gross * p.retirePct / 100, pretax = Math.min(p.pretax, Math.max(0, gross - retire));
+  const fedWages = Math.max(0, gross - retire - pretax), ficaWages = Math.max(0, gross - pretax);
+  const fedEstimated = p.fedPct === null || p.fedPct === '' || isNaN(p.fedPct);
+  const fed = (fedEstimated ? fedTaxAnnual(fedWages * 26, p.filing) / 26 : fedWages * p.fedPct / 100) + (+p.extraFed || 0);
+  const ss = ficaWages * .062, med = ficaWages * .0145, state = fedWages * p.statePct / 100;
+  const net = gross - retire - pretax - fed - ss - med - state - p.posttax;
+  return { regular: r2(regular), overtime: r2(overtime), gross: r2(gross), retire: r2(retire), pretax: r2(pretax), fed: r2(fed), fedEstimated,
+    ss: r2(ss), med: r2(med), state: r2(state), posttax: r2(p.posttax), net: r2(Math.max(0, net)) };
+}
+// What this pay period has to spend: the real check if logged, otherwise the estimate.
+function paycheckFor(pk) {
+  const inc = txIn(pk).filter(t => t.type === 'income');
+  const checks = inc.filter(t => t.paycheck), other = inc.filter(t => !t.paycheck).reduce((s, t) => s + t.amount, 0);
+  if (checks.length) return { amount: checks.reduce((s, t) => s + t.amount, 0), kind: 'actual', other, tx: checks };
+  if (payConfigured()) return { amount: calcPay(pay(), hoursFor(pk)).net, kind: 'estimate', other };
+  return { amount: 0, kind: 'none', other };
+}
 const totalBudget = () => db.categories.reduce((s, c) => s + (+c.limit || 0), 0);
 const level = (spent, limit) => !limit ? (spent > 0 ? 'over' : 'good') : spent > limit ? 'over' : spent / limit >= .85 ? 'warn' : 'good';
 const soft = hex => hex + '24';
@@ -310,25 +369,34 @@ let toastT;
 function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 2600); }
 
 /* ---------- State ---------- */
-const state = { tab: 'overview', ym: thisMonth(), filterCat: null };
+const state = { tab: 'overview', pk: thisPeriod(), filterCat: null };
 try { const t = localStorage.getItem(KEY + ':tab'); if (['overview', 'spending', 'bills', 'goals'].includes(t)) state.tab = t; } catch (e) {}
 
 /* ---------- Bills logic ---------- */
 function billTx(b, ym) { const id = b.paid && b.paid[ym]; return id ? db.transactions.find(t => t.id === id) : null; }
-function billDay(b, ym) { return Math.min(b.dueDay, daysInMonth(ym)); }
-function billStatus(b, ym) {
-  if (billTx(b, ym)) return { cls: 'paid', text: 'Paid' };
-  const cur = thisMonth(), day = billDay(b, ym);
-  if (ym < cur) return { cls: 'late', text: 'Not paid' };
-  if (ym > cur) return { cls: '', text: `Due the ${ordinal(day)}` };
-  const diff = day - new Date().getDate();
-  if (diff < 0) return { cls: 'late', text: `${-diff}d overdue` };
+const billDate = (b, ym) => `${ym}-${pad(Math.min(b.dueDay, daysInMonth(ym)))}`;
+// The bill's due date inside this pay period, or else its next due date after it.
+function billOcc(b, pk) {
+  const end = periodEnd(pk);
+  for (const ym of new Set([pk.slice(0, 7), end.slice(0, 7)])) {
+    const d = billDate(b, ym);
+    if (d >= pk && d <= end) return { ym, date: d, inPeriod: true };
+  }
+  let ym = end.slice(0, 7);
+  if (billDate(b, ym) <= end) ym = shiftMonth(ym, 1);
+  return { ym, date: billDate(b, ym), inPeriod: false };
+}
+function billStatus(b, occ) {
+  if (billTx(b, occ.ym)) return { cls: 'paid', text: 'Paid' };
+  const diff = dayNum(occ.date) - dayNum(todayISO());
+  if (diff < 0) return { cls: 'late', text: diff < -20 ? 'Not paid' : `${-diff}d overdue` };
   if (diff === 0) return { cls: 'soon', text: 'Due today' };
   if (diff <= 5) return { cls: 'soon', text: `Due in ${diff}d` };
-  return { cls: '', text: `Due the ${ordinal(day)}` };
+  return { cls: '', text: 'Due ' + shortDate(occ.date, { weekday: 'short', month: 'short', day: 'numeric' }) };
 }
 function toggleBill(id) {
-  const ym = state.ym, b = db.bills.find(x => x.id === id); if (!b) return;
+  const b = db.bills.find(x => x.id === id); if (!b) return;
+  const { ym, date } = billOcc(b, state.pk);
   b.paid = b.paid || {};
   const t = billTx(b, ym);
   if (t) {
@@ -336,7 +404,7 @@ function toggleBill(id) {
     delete b.paid[ym];
     toast(`${b.name} marked unpaid`);
   } else {
-    const tx = { id: uid(), type: 'expense', amount: b.amount, catId: b.catId, date: `${ym}-${pad(billDay(b, ym))}`, note: b.name, billId: b.id };
+    const tx = { id: uid(), type: 'expense', amount: b.amount, catId: b.catId, date, note: b.name, billId: b.id };
     db.transactions.push(tx);
     b.paid[ym] = tx.id;
     toast(`${b.name} paid · added to spending`);
@@ -357,21 +425,21 @@ function donutSVG(items, total) {
     <text x="21" y="21.5" text-anchor="middle" font-size="5.2" font-weight="700">${esc(money(total, true))}</text>
     <text x="21" y="27" text-anchor="middle" font-size="3.2" style="fill:var(--muted)">spent</text></svg>`;
 }
-function barsSVG(endYm) {
-  const months = [5, 4, 3, 2, 1, 0].map(n => shiftMonth(endYm, -n));
-  const vals = months.map(m => spentIn(m));
+function barsSVG(endPk) {
+  const periods = [5, 4, 3, 2, 1, 0].map(n => shiftPeriod(endPk, -n));
+  const vals = periods.map(p => spentIn(p));
   const budget = totalBudget();
   const max = Math.max(budget, ...vals, 1) * 1.08;
   const W = 300, H = 150, top = 8, bottom = 126, bw = 30, gap = (W - bw * 6) / 6;
   const y = v => bottom - (v / max) * (bottom - top);
-  let out = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Spending over the last six months">`;
+  let out = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Spending over the last six pay periods">`;
   out += `<line x1="0" x2="${W}" y1="${bottom}" y2="${bottom}" stroke="var(--line)"/>`;
-  months.forEach((m, i) => {
+  periods.forEach((m, i) => {
     const x = gap / 2 + i * (bw + gap), v = vals[i], over = budget && v > budget;
     const h = Math.max(bottom - y(v), v > 0 ? 2 : 0);
     const color = over ? 'var(--danger)' : 'var(--accent)';
-    out += `<rect x="${x}" y="${bottom - h}" width="${bw}" height="${h}" rx="5" fill="${color}" opacity="${m === endYm ? 1 : .45}"><title>${esc(monthLabel(m))}: ${esc(money(v))}</title></rect>`;
-    out += `<text x="${x + bw / 2}" y="${bottom + 16}" text-anchor="middle" ${m === endYm ? 'style="fill:var(--text);font-weight:600"' : ''}>${esc(monthLabel(m, { month: 'short' }))}</text>`;
+    out += `<rect x="${x}" y="${bottom - h}" width="${bw}" height="${h}" rx="5" fill="${color}" opacity="${m === endPk ? 1 : .45}"><title>${esc(periodLabel(m))}: ${esc(money(v))}</title></rect>`;
+    out += `<text x="${x + bw / 2}" y="${bottom + 16}" text-anchor="middle" ${m === endPk ? 'style="fill:var(--text);font-weight:600"' : ''}>${esc(shortDate(m))}</text>`;
     if (v > 0) out += `<text x="${x + bw / 2}" y="${bottom - h - 4}" text-anchor="middle" font-size="9">${esc(compact(v))}</text>`;
   });
   if (budget) out += `<line x1="0" x2="${W}" y1="${y(budget)}" y2="${y(budget)}" stroke="var(--muted)" stroke-dasharray="4 4" opacity=".7"/>`;
@@ -384,28 +452,46 @@ function compact(v) {
 
 /* ---------- Views ---------- */
 function viewOverview() {
-  const ym = state.ym, spent = spentIn(ym), budget = totalBudget(), left = budget - spent;
-  const pct = budget ? Math.min(100, spent / budget * 100) : 0, lv = level(spent, budget);
-  const income = incomeIn(ym), isCur = ym === thisMonth();
+  const ym = state.pk, spent = spentIn(ym), budget = totalBudget();
+  const pc = paycheckFor(ym), moneyIn = pc.amount + pc.other;
+  const base = pc.kind === 'none' ? budget : moneyIn, left = base - spent;
+  const pct = base ? Math.min(100, spent / base * 100) : (spent ? 100 : 0), lv = level(spent, base);
+  const isCur = ym === thisPeriod();
   let pill = '';
-  if (left < 0) pill = `<span class="pill over">${money(-left)} over budget</span>`;
-  else if (isCur && budget) { const dl = daysInMonth(ym) - new Date().getDate() + 1; pill = `<span class="pill">${dl} day${dl > 1 ? 's' : ''} left · about ${money(left / dl, true)} a day</span>`; }
+  if (left < 0) pill = `<span class="pill over">${money(-left)} over ${pc.kind === 'none' ? 'budget' : 'this paycheck'}</span>`;
+  else if (isCur && base) { const dl = dayNum(periodEnd(ym)) - dayNum(todayISO()) + 1; pill = `<span class="pill">${dl} day${dl > 1 ? 's' : ''} left · about ${money(left / dl, true)} a day</span>`; }
+
+  let payRow;
+  if (pc.kind === 'actual') payRow = `<div class="payrow"><div class="grow"><div class="sub">Paycheck · received</div><b class="num">${money(pc.amount)}</b></div>
+      <button class="btn sm" data-act="edit-tx" data-id="${pc.tx[0].id}">Edit</button></div>`;
+  else if (pc.kind === 'estimate') payRow = `<div class="payrow"><div class="grow"><div class="sub">Paycheck · estimated${hoursFor(ym).custom ? ' (custom hours)' : ''}</div><b class="num">${money(pc.amount)}</b></div>
+      <button class="btn sm" data-act="pay-calc">Adjust</button><button class="btn sm primary" data-act="got-paid">I got paid</button></div>`;
+  else payRow = `<div class="payrow"><div class="grow"><div class="sub">Base the budget on your paycheck</div></div>
+      <button class="btn sm" data-act="got-paid">Enter check</button><button class="btn sm primary" data-act="pay-calc">Set up</button></div>`;
+  let planNote = '';
+  if (pc.kind !== 'none' && budget) {
+    const diff = moneyIn - budget;
+    planNote = `<div class="meta num small"><span>Category budgets ${money(budget, true)}</span><span class="${diff < 0 ? 'left-over' : ''}">${diff < 0 ? `${money(-diff, true)} more than you make` : `${money(diff, true)} unbudgeted`}</span></div>`;
+  }
 
   let h = syncBanner() + `<section class="card hero">
-    <div class="label">${left < 0 ? 'Over budget' : 'Left to spend'}</div>
+    <div class="label">${left < 0 ? 'Over' : 'Left to spend'} · ${esc(periodLabel(ym))}</div>
     <div class="big num ${left < 0 ? 'over' : ''}">${money(Math.abs(left))}</div>
     <div class="bar thick ${lv}"><i style="width:${pct}%"></i></div>
-    <div class="meta num"><span>Spent ${money(spent)}</span><span>Budget ${money(budget)}</span></div>
-    ${income ? `<div class="meta num"><span>Income logged</span><span style="color:var(--good)">${money(income)}</span></div>` : ''}
+    <div class="meta num"><span>Spent ${money(spent)}</span><span>${pc.kind === 'none' ? 'Budget' : 'Money in'} ${money(base)}</span></div>
+    ${pc.other ? `<div class="meta num"><span>Other income</span><span style="color:var(--good)">${money(pc.other)}</span></div>` : ''}
+    ${planNote}
+    ${payRow}
     ${pill}</section>`;
 
-  // Bills due
+  // Bills due this pay period
   if (db.bills.length) {
-    const unpaid = db.bills.filter(b => !billTx(b, ym)).sort((a, b) => a.dueDay - b.dueDay);
-    const paidCount = db.bills.length - unpaid.length;
-    h += `<section class="card"><h3>Bills <button class="link" data-act="tab" data-tab="bills">${paidCount} of ${db.bills.length} paid ›</button></h3>`;
-    if (!unpaid.length) h += `<div class="sub" style="padding:6px 0">All bills paid this month 🎉</div>`;
-    else h += `<div class="list">${unpaid.slice(0, 3).map(b => billRow(b, ym)).join('')}</div>`;
+    const due = db.bills.map(b => ({ b, occ: billOcc(b, ym) })).filter(x => x.occ.inPeriod).sort((a, b) => a.occ.date.localeCompare(b.occ.date));
+    const unpaid = due.filter(x => !billTx(x.b, x.occ.ym));
+    h += `<section class="card"><h3>Bills this pay period <button class="link" data-act="tab" data-tab="bills">${due.length - unpaid.length} of ${due.length} paid ›</button></h3>`;
+    if (!due.length) h += `<div class="sub" style="padding:6px 0">No bills due this pay period.</div>`;
+    else if (!unpaid.length) h += `<div class="sub" style="padding:6px 0">All paid 🎉</div>`;
+    else h += `<div class="list">${unpaid.slice(0, 3).map(x => billRow(x.b, ym)).join('')}</div>`;
     h += `</section>`;
   }
 
@@ -430,17 +516,17 @@ function viewOverview() {
   // Charts
   const items = cats.map(c => ({ name: c.name, color: c.color, value: c._spent ?? spentIn(ym, c.id) })).filter(i => i.value > 0).sort((a, b) => b.value - a.value);
   h += `<section class="card"><h3>Where it went</h3>`;
-  if (!items.length) h += `<div class="sub" style="padding:8px 0">No spending logged for ${esc(monthLabel(ym, { month: 'long' }))} yet.</div>`;
+  if (!items.length) h += `<div class="sub" style="padding:8px 0">No spending logged this pay period yet.</div>`;
   else h += `<div class="chart-wrap">${donutSVG(items, spent)}<div class="legend">${items.slice(0, 7).map(i =>
       `<div><span class="sw" style="background:${i.color}"></span><span class="lname">${esc(i.name)}</span><span class="num muted">${Math.round(i.value / spent * 100)}%</span></div>`).join('')}
       ${items.length > 7 ? `<div class="muted">+${items.length - 7} more</div>` : ''}</div></div>`;
   h += `</section>`;
-  h += `<section class="card bars"><h3>Last 6 months <span class="small muted" style="font-weight:400">- - budget</span></h3>${barsSVG(ym)}</section>`;
+  h += `<section class="card bars"><h3>Last 6 pay periods <span class="small muted" style="font-weight:400">- - budget</span></h3>${barsSVG(ym)}</section>`;
   return h;
 }
 
-function billRow(b, ym) {
-  const st = billStatus(b, ym), paid = st.cls === 'paid', c = cat(b.catId);
+function billRow(b, pk) {
+  const st = billStatus(b, billOcc(b, pk)), paid = st.cls === 'paid', c = cat(b.catId);
   return `<div class="item">
     <button class="check ${paid ? 'on' : ''}" data-act="toggle-bill" data-id="${b.id}" aria-label="${paid ? 'Mark unpaid' : 'Mark paid'}: ${esc(b.name)}">${paid ? CHECK : ''}</button>
     <button class="grow" data-act="edit-bill" data-id="${b.id}" style="background:none;border:0;padding:0;text-align:left;display:flex;align-items:center;gap:10px;min-width:0">
@@ -450,7 +536,7 @@ function billRow(b, ym) {
 }
 
 function viewSpending() {
-  const ym = state.ym;
+  const ym = state.pk;
   let list = txIn(ym);
   const usedCats = db.categories.filter(c => list.some(t => t.catId === c.id));
   if (state.filterCat === 'income') list = list.filter(t => t.type === 'income');
@@ -480,7 +566,7 @@ function viewSpending() {
     ${f && f !== 'income' && f !== 'none' && cat(f).limit ? `<div style="text-align:right"><div class="sub">Budget</div><div style="font-size:24px;font-weight:700">${money(cat(f).limit, true)}</div></div>` : ''}
   </div></section>`;
 
-  if (!list.length) return h + `<div class="empty"><div class="e">🧾</div>Nothing logged here for ${esc(monthLabel(ym, { month: 'long' }))}.<br><button class="btn primary" data-act="add-tx">Add an expense</button></div>`;
+  if (!list.length) return h + `<div class="empty"><div class="e">🧾</div>Nothing logged here this pay period.<br><button class="btn primary" data-act="add-tx">Add an expense</button></div>`;
 
   const today = isoDate(new Date()), yest = isoDate(new Date(Date.now() - 864e5));
   let lastDate = null;
@@ -493,7 +579,7 @@ function viewSpending() {
       const dayTotal = list.filter(x => x.date === t.date && x.type !== 'income').reduce((s, x) => s + x.amount, 0);
       head = `<div class="day"><span>${label}</span><span class="num">${dayTotal ? money(dayTotal) : ''}</span></div>`;
     }
-    const inc = t.type === 'income', c = inc ? { emoji: '💵', name: 'Income', color: '#2f7d5b' } : cat(t.catId);
+    const inc = t.type === 'income', c = inc ? { emoji: '💵', name: t.paycheck ? 'Paycheck' : 'Income', color: '#2f7d5b' } : cat(t.catId);
     return head + `<button class="item" data-act="edit-tx" data-id="${t.id}" style="border-top:0;padding:8px 0">
       <div class="emoji" style="background:${soft(c.color)}">${esc(c.emoji)}</div>
       <div class="grow"><div class="name">${esc(t.note || c.name)}</div><div class="sub">${esc(t.note ? c.name : '')}${t.billId ? (t.note ? ' · ' : '') + 'Bill' : ''}</div></div>
@@ -503,20 +589,23 @@ function viewSpending() {
 }
 
 function viewBills() {
-  const ym = state.ym;
+  const pk = state.pk;
   if (!db.bills.length) return `<div class="empty" style="padding-top:60px"><div class="e">📅</div><b>No bills yet</b><br>Add rent, phone, streaming, insurance —<br>anything that repeats every month.<br><button class="btn primary" data-act="add-bill">Add a bill</button></div>`;
-  const bills = [...db.bills].sort((a, b) => a.dueDay - b.dueDay || a.name.localeCompare(b.name));
-  const total = bills.reduce((s, b) => s + b.amount, 0);
-  const paid = bills.filter(b => billTx(b, ym));
-  const paidAmt = paid.reduce((s, b) => s + billTx(b, ym).amount, 0);
+  const all = db.bills.map(b => ({ b, occ: billOcc(b, pk) })).sort((a, b) => a.occ.date.localeCompare(b.occ.date) || a.b.name.localeCompare(b.b.name));
+  const due = all.filter(x => x.occ.inPeriod), later = all.filter(x => !x.occ.inPeriod);
+  const total = due.reduce((s, x) => s + x.b.amount, 0);
+  const paid = due.filter(x => billTx(x.b, x.occ.ym));
+  const paidAmt = paid.reduce((s, x) => s + billTx(x.b, x.occ.ym).amount, 0);
   return `<section class="card hero">
-      <div class="label">Bills for ${esc(monthLabel(ym, { month: 'long' }))}</div>
+      <div class="label">Due ${esc(periodLabel(pk))}</div>
       <div class="big num">${money(total)}</div>
       <div class="bar thick"><i style="width:${total ? Math.min(100, paidAmt / total * 100) : 0}%"></i></div>
-      <div class="meta num"><span>${paid.length} of ${bills.length} paid</span><span>${money(Math.max(0, total - paidAmt))} to go</span></div>
+      <div class="meta num"><span>${paid.length} of ${due.length} paid</span><span>${money(Math.max(0, total - paidAmt))} to go</span></div>
     </section>
-    <section class="card"><h3>Every month</h3><div class="list">${bills.map(b => billRow(b, ym)).join('')}</div>
-    <div class="note">Tap the circle when a bill is paid — it's added to your spending automatically.</div></section>`;
+    <section class="card"><h3>This pay period</h3>
+      ${due.length ? `<div class="list">${due.map(x => billRow(x.b, pk)).join('')}</div>` : '<div class="sub" style="padding:6px 0">Nothing due this pay period.</div>'}</section>
+    ${later.length ? `<section class="card"><h3>Coming up later</h3><div class="list">${later.map(x => billRow(x.b, pk)).join('')}</div></section>` : ''}
+    <div class="note">Tap the circle when a bill is paid. It's added to your spending automatically.</div>`;
 }
 
 function viewGoals() {
@@ -548,7 +637,8 @@ function viewGoals() {
 const FAB_LABEL = { overview: 'Add expense', spending: 'Add expense', bills: 'Add bill', goals: 'Add goal' };
 function render() {
   document.querySelectorAll('.tabbar button').forEach(b => b.classList.toggle('on', b.dataset.tab === state.tab));
-  $('#monthLabel').textContent = monthLabel(state.ym);
+  state.pk = periodOf(state.pk); // stays aligned if the pay-period start date changes
+  $('#monthLabel').textContent = periodLabel(state.pk);
   $('#fab').setAttribute('aria-label', FAB_LABEL[state.tab]);
   const views = { overview: viewOverview, spending: viewSpending, bills: viewBills, goals: viewGoals };
   $('#main').innerHTML = views[state.tab]();
@@ -591,7 +681,7 @@ function txForm(id) {
   const t = id ? db.transactions.find(x => x.id === id) : null;
   let type = t?.type || 'expense';
   const preCat = t?.catId ?? (state.filterCat && db.categories.some(c => c.id === state.filterCat) ? state.filterCat : null);
-  const defDate = t?.date || (state.ym === thisMonth() ? isoDate(new Date()) : `${state.ym}-01`);
+  const defDate = t?.date || (inPeriod(todayISO(), state.pk) ? todayISO() : state.pk);
   const root = openSheet(`<form id="f" autocomplete="off">
     <h2>${t ? 'Edit' : 'New'} ${type === 'income' ? 'income' : 'expense'}</h2>
     <div class="seg"><button type="button" data-type="expense">Expense</button><button type="button" data-type="income">Income</button></div>
@@ -599,6 +689,7 @@ function txForm(id) {
     <div class="field" id="catField"><span>Category</span><div class="chips">
       ${db.categories.map(c => `<label class="chip"><input type="radio" name="cat" value="${c.id}" ${c.id === preCat ? 'checked' : ''}><span>${esc(c.emoji)} ${esc(c.name)}</span></label>`).join('')}
     </div></div>
+    <label class="chip" id="payChk" style="display:inline-block;margin-top:4px"><input type="checkbox" name="paycheck" ${t ? (t.paycheck ? 'checked' : '') : 'checked'}><span>💵 This is my paycheck</span></label>
     <div class="two"><label class="field"><span>Date</span><input type="date" name="date" value="${defDate}" required></label>
     <label class="field"><span>Note (optional)</span><input name="note" maxlength="80" placeholder="e.g. Target" value="${esc(t?.note || '')}"></label></div>
     ${t?.billId ? '<div class="note">This came from a bill. Deleting it marks the bill unpaid.</div>' : ''}
@@ -608,6 +699,7 @@ function txForm(id) {
     type = ty;
     root.querySelectorAll('.seg button').forEach(b => b.classList.toggle('on', b.dataset.type === ty));
     root.querySelector('#catField').hidden = ty === 'income';
+    root.querySelector('#payChk').hidden = ty !== 'income';
     root.querySelector('h2').textContent = `${t ? 'Edit' : 'New'} ${ty}`;
   };
   root.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => setType(b.dataset.type)));
@@ -624,15 +716,14 @@ function txForm(id) {
     const catId = type === 'income' ? null : (f.querySelector('input[name=cat]:checked')?.value || null);
     if (type === 'expense' && !catId) { toast('Pick a category'); return; }
     const date = f.date.value || isoDate(new Date());
-    const data = { type, amount, catId, date, note: f.note.value.trim() };
+    const data = { type, amount, catId, date, note: f.note.value.trim(), paycheck: type === 'income' && f.paycheck.checked };
     const cur = fresh('transactions', t);
     if (cur) Object.assign(cur, data);
     else db.transactions.push(t ? { ...t, ...data } : { id: uid(), created: Date.now(), ...data });
     save(); closeSheet();
-    const ym = date.slice(0, 7);
-    if (ym !== state.ym) toast(`Saved to ${monthLabel(ym)}`);
+    if (!inPeriod(date, state.pk)) toast(`Saved to ${periodLabel(periodOf(date))}`);
     else if (!t && type === 'expense') {
-      const c = cat(catId), rem = (+c.limit || 0) - spentIn(ym, catId);
+      const c = cat(catId), rem = (+c.limit || 0) - spentIn(state.pk, catId);
       toast(c.limit ? (rem >= 0 ? `${money(rem, true)} left in ${c.name}` : `${c.name} is ${money(-rem, true)} over`) : 'Saved');
     } else toast('Saved');
     render();
@@ -647,7 +738,7 @@ function catForm(id, back) {
       <label class="field" style="margin-bottom:0"><span>Icon</span><input class="emoji-in" name="emoji" maxlength="8" value="${esc(c?.emoji || '🏷️')}"></label>
       <label class="field grow" style="margin-bottom:0"><span>Name</span><input name="name" maxlength="30" required value="${esc(c?.name || '')}" ${c ? '' : 'autofocus'} placeholder="e.g. Kids"></label>
     </div>
-    <div class="field"><span>Monthly budget</span>${moneyInput('limit', c?.limit)}</div>
+    <div class="field"><span>Budget per paycheck</span>${moneyInput('limit', c?.limit)}</div>
     ${c ? '<div class="note">Deleting a category keeps its past spending, labeled “Uncategorized”.</div>' : ''}
     ${actions(!!c)}</form>`);
   const f = root.querySelector('#f');
@@ -762,11 +853,16 @@ function settingsSheet() {
   const root = openSheet(`<h2>Settings</h2>
     <h4>Categories &amp; monthly budgets</h4>
     <div>${db.categories.map(c => `<div class="set-row"><div class="emoji" style="background:${soft(c.color)}">${esc(c.emoji)}</div>
-      <div class="grow"><div class="name">${esc(c.name)}</div><div class="sub num">${money(c.limit, true)} / month</div></div>
+      <div class="grow"><div class="name">${esc(c.name)}</div><div class="sub num">${money(c.limit, true)} / paycheck</div></div>
       <button class="btn sm" data-edit-cat="${c.id}">Edit</button></div>`).join('')}</div>
     <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px">
-      <span class="sub num">Total ${money(totalBudget(), true)} / month</span>
+      <span class="sub num">Total ${money(totalBudget(), true)} / paycheck</span>
       <button class="btn sm primary" data-add-cat>+ Category</button></div>
+    <h4>Paycheck &amp; pay periods</h4>
+    <div class="set-row"><div class="emoji" style="background:var(--accent-soft)">💵</div>
+      <div class="grow"><div class="name">Paycheck calculator</div><div class="sub num">${payConfigured() ? `About ${money(calcPay(pay(), { hours: pay().hours, otHours: pay().otHours }).net)} take-home` : 'Not set up yet'}</div></div>
+      <button class="btn sm" data-pay>${payConfigured() ? 'Edit' : 'Set up'}</button></div>
+    <label class="field"><span>Pay periods run every 2 weeks, starting</span><input type="date" id="anchor" value="${anchor()}"></label>
     <h4>Currency</h4>
     <label class="field" style="margin-top:0"><select id="cur">${CURRENCIES.map(c => `<option ${c === db.settings.currency ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
     ${syncSection()}
@@ -782,6 +878,12 @@ function settingsSheet() {
   root.querySelector('[data-cancel]').onclick = closeSheet;
   root.querySelectorAll('[data-edit-cat]').forEach(b => b.onclick = () => catForm(b.dataset.editCat, true));
   root.querySelector('[data-add-cat]').onclick = () => catForm(null, true);
+  root.querySelector('[data-pay]').onclick = () => payForm(true);
+  root.querySelector('#anchor').onchange = e => {
+    if (!e.target.value) return;
+    db.settings.payAnchor = e.target.value; save();
+    state.pk = thisPeriod(); render(); toast(`Pay period now ${periodLabel(state.pk)}`);
+  };
   root.querySelector('#cur').onchange = e => { db.settings.currency = e.target.value; save(); render(); settingsSheet(); };
   root.querySelector('[data-export]').onclick = exportData;
   root.querySelector('[data-import]').onclick = () => $('#importFile').click();
@@ -793,9 +895,96 @@ function settingsSheet() {
   root.querySelector('[data-reset]').onclick = () => {
     if (!confirm(Sync.live ? 'Erase the SHARED budget? This deletes all spending, bills, goals and categories for both of you. Back up first if you might want them.' : 'Erase all spending, bills, goals and categories on this phone? Back up first if you might want them.')) return;
     if (!confirm('Really erase everything? This cannot be undone.')) return;
-    db = defaults(); save(); closeSheet(); state.ym = thisMonth(); render(); toast('Fresh start');
+    db = defaults(); save(); closeSheet(); state.pk = thisPeriod(); render(); toast('Fresh start');
   };
 }
+/* Paycheck calculator */
+function payForm(back) {
+  const p = pay(), pk = state.pk, h = hoursFor(pk);
+  const num = v => (v === null || v === undefined || v === 0) ? '' : v;
+  const root = openSheet(`<form id="f" autocomplete="off"><h2>Paycheck calculator</h2>
+    <div class="two" style="margin-top:-6px">
+      <label class="field"><span>Hourly rate</span><input name="rate" inputmode="decimal" placeholder="0.00" value="${num(p.rate)}" ${p.rate ? '' : 'autofocus'}></label>
+      <label class="field"><span>Filing status</span><select name="filing">
+        <option value="single" ${p.filing === 'single' ? 'selected' : ''}>Single</option>
+        <option value="married" ${p.filing === 'married' ? 'selected' : ''}>Married, jointly</option>
+        <option value="hoh" ${p.filing === 'hoh' ? 'selected' : ''}>Head of household</option></select></label>
+    </div>
+    <h4>Hours · ${esc(periodLabel(pk))}</h4>
+    <div class="two" style="margin-top:-8px">
+      <label class="field"><span>Regular hours</span><input name="hours" inputmode="decimal" value="${h.hours}"></label>
+      <label class="field"><span>Overtime hours (×${p.otMult})</span><input name="ot" inputmode="decimal" value="${h.otHours || ''}" placeholder="0"></label>
+    </div>
+    <label class="chip" style="display:inline-block;margin-top:10px"><input type="checkbox" name="usual" ${h.custom ? '' : 'checked'}><span>Use these hours for every paycheck</span></label>
+    <h4>Deductions per paycheck</h4>
+    <div class="two" style="margin-top:-8px">
+      <label class="field"><span>401(k) / retirement %</span><input name="retire" inputmode="decimal" placeholder="0" value="${num(p.retirePct)}"></label>
+      <label class="field"><span>Pre-tax insurance/HSA $</span><input name="pretax" inputmode="decimal" placeholder="0" value="${num(p.pretax)}"></label>
+      <label class="field"><span>State income tax %</span><input name="state" inputmode="decimal" placeholder="0" value="${num(p.statePct)}"></label>
+      <label class="field"><span>After-tax deductions $</span><input name="posttax" inputmode="decimal" placeholder="0" value="${num(p.posttax)}"></label>
+      <label class="field"><span>Federal tax</span><select name="fedMode"><option value="auto">Estimate for me</option><option value="pct" ${p.fedPct !== null && p.fedPct !== '' ? 'selected' : ''}>Use my %</option></select></label>
+      <label class="field" id="fedPctField"><span>Federal %</span><input name="fedPct" inputmode="decimal" placeholder="e.g. 9" value="${p.fedPct ?? ''}"></label>
+    </div>
+    <div class="card" id="breakdown" style="margin-top:16px;background:var(--bg)"></div>
+    <div class="note">An estimate based on 2026 federal tax tables. Your real check may differ a little. When you get paid, tap “I got paid” to use the exact amount.</div>
+    ${actions(false)}</form>`);
+  const f = root.querySelector('#f');
+  const read = () => {
+    const n = (v, d = 0) => { const x = parseAmt(v); return isNaN(x) ? d : x; };
+    const fedMode = f.fedMode.value;
+    return {
+      p: { ...p, rate: n(f.rate.value), filing: f.filing.value, retirePct: n(f.retire.value), pretax: n(f.pretax.value), statePct: n(f.state.value),
+        posttax: n(f.posttax.value), fedPct: fedMode === 'pct' ? n(f.fedPct.value) : null },
+      h: { hours: n(f.hours.value), otHours: n(f.ot.value) }
+    };
+  };
+  const line = (label, v, neg) => `<div class="brk num"><span>${label}</span><span>${neg && v ? '−' : ''}${money(v)}</span></div>`;
+  const update = () => {
+    const { p: np, h: nh } = read(), r = calcPay(np, nh);
+    root.querySelector('#fedPctField').hidden = f.fedMode.value !== 'pct';
+    root.querySelector('#breakdown').innerHTML =
+      line(`Regular (${nh.hours} h)`, r.regular) + (r.overtime ? line(`Overtime (${nh.otHours} h)`, r.overtime) : '') +
+      `<div class="brk total num"><span>Gross pay</span><span>${money(r.gross)}</span></div>` +
+      (r.retire ? line('401(k)', r.retire, 1) : '') + (r.pretax ? line('Pre-tax insurance', r.pretax, 1) : '') +
+      line(`Federal tax${r.fedEstimated ? ' (est.)' : ''}`, r.fed, 1) + line('Social Security 6.2%', r.ss, 1) + line('Medicare 1.45%', r.med, 1) +
+      (r.state ? line('State tax', r.state, 1) : '') + (r.posttax ? line('After-tax deductions', r.posttax, 1) : '') +
+      `<div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)"><b>Take-home</b><b class="num" style="font-size:24px;color:var(--accent)">${money(r.net)}</b></div>`;
+  };
+  f.addEventListener('input', update); f.addEventListener('change', update); update();
+  wireCommon(root);
+  root.querySelector('[data-cancel]').onclick = () => back ? settingsSheet() : closeSheet();
+  f.addEventListener('submit', e => {
+    e.preventDefault();
+    const { p: np, h: nh } = read();
+    if (!(np.rate > 0)) { toast('Enter your hourly rate'); f.rate.focus(); return; }
+    const ph = { ...(db.settings.periodHours || {}) };
+    if (f.usual.checked) { np.hours = nh.hours; np.otHours = nh.otHours; delete ph[pk]; }
+    else ph[pk] = nh;
+    db.settings.pay = np; db.settings.periodHours = ph;
+    save(); render(); back ? settingsSheet() : closeSheet();
+    toast(`Estimated take-home ${money(calcPay(np, hoursFor(pk)).net)}`);
+  });
+}
+function gotPaidForm() {
+  const pk = state.pk, pc = paycheckFor(pk);
+  const est = pc.kind === 'estimate' ? pc.amount : '';
+  const root = openSheet(`<form id="f" autocomplete="off"><h2>I got paid 💵</h2>
+    <div class="sub" style="margin-top:-8px">Enter the take-home amount from your check. It replaces the estimate for this pay period.</div>
+    <div class="field">${moneyInput('amount', est, true)}</div>
+    <label class="field"><span>Date received</span><input type="date" name="date" value="${inPeriod(todayISO(), pk) ? todayISO() : pk}" required></label>
+    ${actions(false)}</form>`);
+  const f = root.querySelector('#f');
+  wireCommon(root);
+  f.addEventListener('submit', e => {
+    e.preventDefault();
+    const amount = parseAmt(f.amount.value);
+    if (!(amount > 0)) { toast('Enter the amount'); return; }
+    db.transactions.push({ id: uid(), created: Date.now(), type: 'income', paycheck: true, amount, catId: null, date: f.date.value, note: 'Paycheck' });
+    save(); closeSheet(); render();
+    toast(inPeriod(f.date.value, pk) ? `Paycheck saved · ${money(amount)}` : `Saved to ${periodLabel(periodOf(f.date.value))}`);
+  });
+}
+
 /* Sync UI */
 const SYNC_TEXT = {
   synced: 'Synced', pending: 'Saving to the cloud…', connecting: 'Connecting…',
@@ -885,6 +1074,8 @@ $('#main').addEventListener('click', e => {
     case 'tab': setTab(el.dataset.tab); break;
     case 'settings': settingsSheet(); break;
     case 'signin': signInSheet(); break;
+    case 'pay-calc': payForm(); break;
+    case 'got-paid': gotPaidForm(); break;
     case 'filter': state.filterCat = id || 'none'; state.tab = 'spending'; try { localStorage.setItem(KEY + ':tab', 'spending'); } catch (_) {} render(); window.scrollTo(0, 0); break;
     case 'filter-chip': state.filterCat = id || null; render(); break;
     case 'add-tx': txForm(); break;
@@ -899,9 +1090,9 @@ $('#main').addEventListener('click', e => {
 });
 document.querySelectorAll('.tabbar button').forEach(b => b.addEventListener('click', () => setTab(b.dataset.tab)));
 $('#fab').addEventListener('click', () => ({ bills: billForm, goals: goalForm }[state.tab] || txForm)());
-$('#prev').addEventListener('click', () => { state.ym = shiftMonth(state.ym, -1); render(); });
-$('#next').addEventListener('click', () => { state.ym = shiftMonth(state.ym, 1); render(); });
-$('#monthLabel').addEventListener('click', () => { if (state.ym !== thisMonth()) { state.ym = thisMonth(); render(); } });
+$('#prev').addEventListener('click', () => { state.pk = shiftPeriod(state.pk, -1); render(); });
+$('#next').addEventListener('click', () => { state.pk = shiftPeriod(state.pk, 1); render(); });
+$('#monthLabel').addEventListener('click', () => { if (state.pk !== thisPeriod()) { state.pk = thisPeriod(); render(); } });
 $('#settingsBtn').addEventListener('click', settingsSheet);
 $('#syncBtn').addEventListener('click', () => Sync.user ? settingsSheet() : signInSheet());
 let lastSyncStatus = Sync.status;
